@@ -116,7 +116,7 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
             name = name.split("?")[0]
             name = urllib.parse.unquote(name)
             name = os.path.basename(name)
-            # replace invalid Windows filename chars with underscore, but preserve spaces
+            # replace invalid Windows filename chars with underscore, but preserve spaces. 
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
             name = name.strip().rstrip('. ')
             # keep spaces (do not replace whitespace with underscores)
