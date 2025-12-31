@@ -3,15 +3,19 @@ import json
 import cv2
 import numpy as np
 from typing import List
+import re
+import urllib.parse
 
 # Mapping of class IDs to class names
 LABELS_MAPPING = {
-    0: "Car",
-    1: "Human"
+    0: "cable",
+
 }
 
-def mapping_class(class_name: str) -> int:
-    """Map a class name to its corresponding class ID."""
+def mapping_class(class_name) -> int:
+    """Map a class name to its corresponding class ID. Accepts string or list."""
+    if isinstance(class_name, list):
+        class_name = class_name[0] if class_name else ""
     try:
         return list(LABELS_MAPPING.keys())[list(LABELS_MAPPING.values()).index(class_name)]
     except ValueError:
@@ -94,7 +98,34 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
     
     skipped_labels = []
     for task in data:
-        image_name = task["data"]["image"].split("/")[-1].split(".")[0]
+        raw_image = task["data"].get("image", "")
+        # Try to extract the 'd' query parameter (Label Studio local file reference) and decode it.
+        parsed = urllib.parse.urlparse(raw_image)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if 'd' in qs and qs['d']:
+            decoded = urllib.parse.unquote(qs['d'][0])
+        else:
+            # Fallback: decode the whole URL or path
+            decoded = urllib.parse.unquote(raw_image)
+        # Normalize separators and take the basename as image filename
+        decoded_norm = decoded.replace('\\', '/').rstrip('/')
+        image_basename = os.path.basename(decoded_norm.split('/')[-1])
+        image_name, _ = os.path.splitext(image_basename)
+
+        def sanitize_filename(name: str) -> str:
+            name = name.split("?")[0]
+            name = urllib.parse.unquote(name)
+            name = os.path.basename(name)
+            # replace invalid Windows filename chars with underscore, but preserve spaces
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+            name = name.strip().rstrip('. ')
+            # keep spaces (do not replace whitespace with underscores)
+            name = name
+            return name
+
+        safe_name = sanitize_filename(image_name)
+        if not safe_name:
+            safe_name = f"task_{task.get('id') or 'unknown'}"
         polygons = []
         
         for annotation in task.get("annotations", []):
@@ -120,14 +151,31 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
                     })
                     continue
                 polygons.append(polygon)
-        
-        with open(os.path.join(output_dir, f"{image_name}.txt"), "w") as f:
-            for polygon in polygons:
-                pts = polygon["points"]
-                class_id = mapping_class(polygon["class"][0])
-                f.write(f"{class_id} {' '.join(map(str, pts))}\n")
-        
-        print(f"Converted: {image_name}.txt")
+
+        if not polygons:
+            print(f"Skipping: {safe_name} (no valid polygons)")
+            continue
+
+        out_path = os.path.join(output_dir, f"{safe_name}.txt")
+        try:
+            with open(out_path, "w", newline='') as f:
+                for polygon in polygons:
+                    pts = polygon["points"]
+                    cls = polygon["class"]
+                    class_label = cls[0] if isinstance(cls, list) else cls
+                    try:
+                        class_id = mapping_class(class_label)
+                    except ValueError as e:
+                        skipped_labels.append({
+                            "task_id": task.get("id"),
+                            "type": "class_mapping",
+                            "detail": str(e)
+                        })
+                        continue
+                    f.write(f"{class_id} {' '.join(map(str, pts))}\n")
+            print(f"Converted: {safe_name}.txt")
+        except OSError as e:
+            print(f"Failed to write file for image '{image_name}' -> '{out_path}': {e}")
     
     print("Conversion completed.")
     if skipped_labels:
