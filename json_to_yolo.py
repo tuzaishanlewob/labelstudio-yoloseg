@@ -5,6 +5,7 @@ import numpy as np
 from typing import List
 import re
 import urllib.parse
+import base64
 
 # Mapping of class IDs to class names
 LABELS_MAPPING = {
@@ -43,54 +44,136 @@ def bytes2bit(data: bytes) -> str:
     """Convert byte array to a binary string."""
     return "".join(str(access_bit(data, i)) for i in range(len(data) * 8))
 
-def brush_to_yolo(rle: List[int], height: int, width: int) -> List[float]:
-    """Convert RLE brush labels to YOLO-compatible normalized polygon coordinates.
-    
-    Args:
-        rle (List[int]): Run-Length Encoding data from LabelStudio.
-        height (int): Image height.
-        width (int): Image width.
-        
-    Returns:
-        List[float]: Normalized (x, y) coordinates for YOLO format.
+def decode_mask_from_rle(rle, height, width):
     """
-    rle_input = InputStream(bytes2bit(rle))
+    返回二值 mask (uint8, 0/255)，支持：
+      - list/tuple/ndarray: 原始字节数组 (RGBA or grayscale) 或按像素值数组 或 LabelStudio 的 packed RLE list
+      - str: base64 编码的图像数据
+      - dict with 'counts': COCO RLE (if pycocotools 可用)
+    """
+    # COCO RLE dict
+    if isinstance(rle, dict) and "counts" in rle:
+        try:
+            from pycocotools import mask as cocomask
+            m = cocomask.decode(rle)
+            if m.ndim == 3:
+                m = m[:, :, 0]
+            return (m > 0).astype(np.uint8) * 255
+        except Exception:
+            raise
 
-    num = rle_input.read(32)
-    word_size = rle_input.read(5) + 1
-    rle_sizes = [rle_input.read(4) + 1 for _ in range(4)]
-    
-    out = np.zeros(num, dtype=np.uint8)
-    i = 0
-    while i < num:
-        x = rle_input.read(1)
-        j = i + 1 + rle_input.read(rle_sizes[rle_input.read(2)])
-        if x:
-            val = rle_input.read(word_size)
-            out[i:j] = val
-            i = j
-        else:
-            while i < j:
-                out[i] = rle_input.read(word_size)
-                i += 1
-    image = np.reshape(out, [height, width, 4])[:, :, 3]
-    
-    _, mask = cv2.threshold(image, 1, 255, cv2.THRESH_BINARY)
+    # base64 string
+    if isinstance(rle, str):
+        try:
+            b = base64.b64decode(rle)
+            img = cv2.imdecode(np.frombuffer(b, np.uint8), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise ValueError("base64 decode -> not an image")
+            if img.ndim == 3 and img.shape[2] == 4:
+                return img[:, :, 3]
+            gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+            return mask
+        except Exception:
+            pass
+
+    # Label Studio packed RLE list (bitstream format)
+    try:
+        # Accept list/tuple/ndarray of ints as packed rle
+        if isinstance(rle, (list, tuple, np.ndarray)) and len(rle) < height * width:
+            bitstr = bytes2bit(bytes(rle))
+            rle_input = InputStream(bitstr)
+
+            num = rle_input.read(32)
+            word_size = rle_input.read(5) + 1
+            rle_sizes = [rle_input.read(4) + 1 for _ in range(4)]
+
+            out = np.zeros(num, dtype=np.uint8)
+            i = 0
+            while i < num:
+                x = rle_input.read(1)
+                j = i + 1 + rle_input.read(rle_sizes[rle_input.read(2)])
+                if x:
+                    val = rle_input.read(word_size)
+                    out[i:j] = val
+                    i = j
+                else:
+                    while i < j:
+                        out[i] = rle_input.read(word_size)
+                        i += 1
+
+            image = np.reshape(out, [height, width, 4])[:, :, 3]
+            _, mask = cv2.threshold(image, 1, 255, cv2.THRESH_BINARY)
+            return mask
+    except Exception:
+        pass
+
+    # list/bytes/ndarray (fallbacks)
+    if isinstance(rle, (list, tuple, np.ndarray, bytes, bytearray)):
+        arr = np.frombuffer(bytes(rle), dtype=np.uint8) if isinstance(rle, (bytes, bytearray)) else np.array(rle, dtype=np.uint8)
+        # RGBA bytes
+        if arr.size == height * width * 4:
+            img = arr.reshape((height, width, 4))
+            return img[:, :, 3]
+        # per-pixel mask
+        if arr.size == height * width:
+            mask = arr.reshape((height, width))
+            return (mask > 0).astype(np.uint8) * 255
+        # 尝试当作编码图像字节（PNG/JPEG）
+        try:
+            img = cv2.imdecode(np.frombuffer(bytes(arr), np.uint8), cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                if img.ndim == 3 and img.shape[2] == 4:
+                    return img[:, :, 3]
+                gray = img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                _, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+                return mask
+        except Exception:
+            pass
+
+    raise ValueError("Unsupported brush RLE/format")
+
+def brush_to_yolo(rle, height, width, min_area=200, epsilon_factor=0.01):
+    """
+    返回 List[List[float]]：每个内层列表为 [x1,y1,x2,y2,...]（均已归一化到 0..1）
+    """
+    mask = decode_mask_from_rle(rle, height, width)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    polygon = []
+    polygons = []
     for cnt in contours:
-        if cv2.contourArea(cnt) > 200:
-            for point in cnt:
-                x, y = point[0]
-                polygon.extend([x / width, y / height])
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        eps = epsilon_factor * cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, eps, True)
+        pts = []
+        for (x, y) in approx.reshape(-1, 2):
+            pts.extend([float(x) / width, float(y) / height])
+        if len(pts) >= 6:
+            polygons.append(pts)
+    return polygons
 
-    return polygon
-
-def polygon_to_yolo(points: List[List[float]]) -> List[float]:
-    polygon = []
-    for x, y in points:
-        polygon.extend([x / 100, y / 100])
-    return polygon
+def polygon_to_yolo(points):
+    """
+    处理多种输入格式：
+      - [{'x':..,'y':..}, ...]
+      - [[x,y], ...]
+    自动判断单位：如果值 <=1 视为已归一化；<=100 视为百分比；否则保留（需要额外宽高时再除以像素）
+    """
+    out = []
+    for p in points:
+        if isinstance(p, dict):
+            x, y = p.get("x", 0), p.get("y", 0)
+        else:
+            x, y = p
+        def norm(v):
+            if v <= 1.0:
+                return v
+            if v <= 100.0:
+                return v / 100.0
+            return v  # 可能为像素，需要调用处知道 width/height 再处理
+        out.extend([norm(float(x)), norm(float(y))])
+    return out
 
 def json_to_yolo(input_file: str, output_dir: str) -> None:
     with open(input_file, "r") as f:
@@ -116,7 +199,7 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
             name = name.split("?")[0]
             name = urllib.parse.unquote(name)
             name = os.path.basename(name)
-            # replace invalid Windows filename chars with underscore, but preserve spaces. 
+            # replace invalid Windows filename chars with underscore, but preserve spaces
             name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
             name = name.strip().rstrip('. ')
             # keep spaces (do not replace whitespace with underscores)
@@ -134,10 +217,13 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
                 width = item["original_width"]
                 
                 if item.get("type") == "brushlabels":
-                    polygon = {
-                        "points": brush_to_yolo(item["value"]["rle"], height, width),
-                        "class": item["value"]["brushlabels"]
-                    }
+                    polys = brush_to_yolo(item["value"]["rle"], height, width)
+                    for p in polys:
+                        polygons.append({
+                            "points": p,
+                            "class": item["value"]["brushlabels"]
+                        })
+                    continue
                 elif item.get("type") == "polygonlabels":
                     polygon = {
                         "points": polygon_to_yolo(item["value"]["points"]),
@@ -172,7 +258,7 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
                             "detail": str(e)
                         })
                         continue
-                    f.write(f"{class_id} {' '.join(map(str, pts))}\n")
+                    f.write(f"{class_id} {' '.join(f'{v:.6f}' for v in pts)}\n")
             print(f"Converted: {safe_name}.txt")
         except OSError as e:
             print(f"Failed to write file for image '{image_name}' -> '{out_path}': {e}")
@@ -183,6 +269,6 @@ def json_to_yolo(input_file: str, output_dir: str) -> None:
 
 if __name__ == "__main__":
     input_file = "brush.json"
-    output_dir = "labels"
+    output_dir = "tunnel/labels"
     os.makedirs(output_dir, exist_ok=True)
     json_to_yolo(input_file, output_dir)
